@@ -1,4 +1,6 @@
 #!/usr/bin/python
+# -- coding: utf-8 --
+
 # Copyright (C) 2016 Google Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,6 +34,85 @@ import grpc
 import pyaudio
 from six.moves import queue
 
+import requests
+import json
+import time
+
+import logging
+import tornado.escape
+import tornado.ioloop
+import tornado.options
+import tornado.web
+import tornado.websocket
+import os.path
+import uuid
+
+from tornado.options import define, options
+
+define("port", default=8888, help="run on the given port", type=int)
+
+class Application(tornado.web.Application):
+    def __init__(self):
+        handlers = [
+            (r"/", MainHandler),
+            (r"/chatsocket", ChatSocketHandler),
+        ]
+        settings = dict(
+            cookie_secret="__TODO:_GENERATE_YOUR_OWN_RANDOM_VALUE_HERE__",
+            template_path=os.path.join(os.path.dirname(__file__), "templates"),
+            static_path=os.path.join(os.path.dirname(__file__), "static"),
+            xsrf_cookies=True,
+        )
+        super(Application, self).__init__(handlers, **settings)
+
+class MainHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.render("index.html", messages=ChatSocketHandler.cache)
+
+class ChatSocketHandler(tornado.websocket.WebSocketHandler):
+    waiters = set()
+    cache = []
+    cache_size = 200
+
+    def get_compression_options(self):
+        # Non-None enables compression with default options.
+        return {}
+
+    def open(self):
+        ChatSocketHandler.waiters.add(self)
+
+    def on_close(self):
+        ChatSocketHandler.waiters.remove(self)
+
+    @classmethod
+    def update_cache(cls, chat):
+        cls.cache.append(chat)
+        if len(cls.cache) > cls.cache_size:
+            cls.cache = cls.cache[-cls.cache_size:]
+
+    @classmethod
+    def send_updates(cls, chat):
+        print("sending updates")
+        logging.info("sending message to %d waiters", len(cls.waiters))
+        for waiter in cls.waiters:
+            try:
+                waiter.write_message(chat)
+            except:
+                logging.error("Error sending message", exc_info=True)
+
+    def on_message(self, message):
+        logging.info("got message %r", message)
+        parsed = tornado.escape.json_decode(message)
+        chat = {
+            "id": str(uuid.uuid4()),
+            "body": parsed["body"],
+            }
+        chat["html"] = tornado.escape.to_basestring(
+            self.render_string("message.html", message=chat))
+
+        ChatSocketHandler.update_cache(chat)
+        ChatSocketHandler.send_updates(chat)
+
 # Audio recording parameters
 RATE = 16000
 CHUNK = int(RATE / 10)  # 100ms
@@ -42,7 +123,6 @@ CHUNK = int(RATE / 10)  # 100ms
 # * https://g.co/cloud/speech/limits#content
 DEADLINE_SECS = 60 * 3 + 5
 SPEECH_SCOPE = 'https://www.googleapis.com/auth/cloud-platform'
-
 
 def make_channel(host, port):
     """Creates a secure channel with auth credentials from the environment."""
@@ -55,7 +135,6 @@ def make_channel(host, port):
 
     return google.auth.transport.grpc.secure_authorized_channel(
         credentials, http_request, target)
-
 
 def _audio_data_generator(buff):
     """A generator that yields all available data in the given buffer.
@@ -86,12 +165,10 @@ def _audio_data_generator(buff):
 
         yield b''.join(data)
 
-
 def _fill_buffer(buff, in_data, frame_count, time_info, status_flags):
     """Continuously collect data from the audio stream, into the buffer."""
     buff.put(in_data)
     return None, pyaudio.paContinue
-
 
 # [START audio_stream]
 @contextlib.contextmanager
@@ -122,7 +199,6 @@ def record_audio(rate, chunk):
     audio_interface.terminate()
 # [END audio_stream]
 
-
 def request_stream(data_stream, rate, interim_results=True):
     """Yields `StreamingRecognizeRequest`s constructed from a recording audio
     stream.
@@ -142,7 +218,8 @@ def request_stream(data_stream, rate, interim_results=True):
         sample_rate=rate,  # the rate in hertz
         # See http://g.co/cloud/speech/docs/languages
         # for a list of supported languages.
-        language_code='en-US',  # a BCP-47 language tag
+        language_code='th-TH',  # a BCP-47 language tag
+        # language_code='en-EN',  # a BCP-47 language tag
     )
     streaming_config = cloud_speech_pb2.StreamingRecognitionConfig(
         interim_results=interim_results,
@@ -156,7 +233,6 @@ def request_stream(data_stream, rate, interim_results=True):
         # Subsequent requests can all just have the content
         yield cloud_speech_pb2.StreamingRecognizeRequest(audio_content=data)
 
-
 def listen_print_loop(recognize_stream):
     """Iterates through server responses and prints them.
 
@@ -169,41 +245,279 @@ def listen_print_loop(recognize_stream):
     final one, print a newline to preserve the finalized transcription.
     """
     num_chars_printed = 0
-    for resp in recognize_stream:
-        if resp.error.code != code_pb2.OK:
-            raise RuntimeError('Server error: ' + resp.error.message)
+    try:
+        for resp in recognize_stream:
+            if resp.error.code != code_pb2.OK:
+                raise RuntimeError('Server error: ' + resp.error.message)
 
-        if not resp.results:
-            continue
+            if not resp.results:
+                continue
 
-        # Display the top transcription
-        result = resp.results[0]
-        transcript = result.alternatives[0].transcript
+            # Display the top transcription
+            result = resp.results[0]
+            transcript = result.alternatives[0].transcript
 
-        # Display interim results, but with a carriage return at the end of the
-        # line, so subsequent lines will overwrite them.
-        #
-        # If the previous result was longer than this one, we need to print
-        # some extra spaces to overwrite the previous result
-        overwrite_chars = ' ' * max(0, num_chars_printed - len(transcript))
+            # Display interim results, but with a carriage return at the end of the
+            # line, so subsequent lines will overwrite them.
+            #
+            # If the previous result was longer than this one, we need to print
+            # some extra spaces to overwrite the previous result
+            overwrite_chars = ' ' * max(0, num_chars_printed - len(transcript))
+            if not result.is_final:
+                sys.stdout.write(transcript + overwrite_chars + '\r')
+                sys.stdout.flush()
 
-        if not result.is_final:
-            sys.stdout.write(transcript + overwrite_chars + '\r')
-            sys.stdout.flush()
+                num_chars_printed = len(transcript)
+                print(transcript)
+            else:
+                print(transcript + overwrite_chars)
 
-            num_chars_printed = len(transcript)
+                # Exit recognition if any of the transcribed phrases could be
+                # one of our keywords.
+                if re.search(r'\b(exit|quit)\b', transcript, re.I):
+                    print('Exiting..')
+                    break
+                elif re.search(r'\b(ออก)\b', transcript, re.I):
+                    print('Exiting..')
+                    break
+                # elif transcript == u'ออโต้ เปิดไฟ ' or transcript == u'เอาโต เปิดไฟ ' or transcript == u'oppo เปิดไฟ ' \
+                #         or transcript == u'auto เปิดไฟ ' or transcript == u' auto เปิดไฟ ' or transcript == u' oppo เปิดไฟ ':
+                #     print('turning on light')
+                # elif transcript == u'ออโต้ ช่วยด้วย ' or transcript == u'เอาโต ช่วยด้วย ' or transcript == u'oppo ช่วยด้วย ' \
+                #         or transcript == u'auto ช่วยด้วย ' or transcript == u' auto ช่วยด้วย ' or transcript == u'เอาตัวช่วยด้วย ' \
+                #         or transcript == u'auto ชื่อด้วย ' or transcript == u'auto ชื่อด้วย ' or transcript == u' oppo ช่วยด้วย ':
+                #     print(u'พร้อมมาช่วยแล้วครับ')
+                # elif transcript == u'ออโต้ เรียกตำรวจ ' or transcript == u'เอาโต เรียกตำรวจ ' or transcript == u'oppo เรียกตำรวจ ' \
+                #         or transcript == u'auto เรียกตำรวจ ' or transcript == u' auto เรียกตำรวจ ' or transcript == u'เอาตัวเรียกตำรวจ ' \
+                #         or transcript == u'auto เรียนตำรวจ ' or transcript == u'auto ตำรวจ ' or transcript == u'ขอโทษตำรวจ ' \
+                #         or transcript == u'เอาตูดตำรวจ ' or transcript == u' auto ตำรวจ ' or transcript == u'auto ตำรวจ ':
+                #     print(u'ตำรวจอยู่ระหว่างทางกำลังมา')
+                # elif transcript == u'ออโต้ โรงพยาบาล ' or transcript == u'อัลโตโรงพยาบาล ' or transcript == u'oppo โรงพยาบาล ' \
+                #         or transcript == u'auto โรงพยาบาล ' or transcript == u' auto โรงพยาบาล ' or transcript == u'เอาตัวโรงพยาบาล ' \
+                #         or transcript == u'เอาตูดโรงพยาบาล ' or transcript == u'also โรงพยาบาล ':
+                #     print(u'โรงพยาบาลกำลังมาช่วยเหลือครับ ')
+                # elif transcript == u'ออโต้ เปิดแอร์ ' or transcript == u'เอาโต เปิดแอร์ ' or transcript == u'oppo เปิดแอร์ ' \
+                #         or transcript == u'auto เปิดแอร์ ' or transcript == u' auto เปิดแอร์ ' or transcript == u'อัลโต้เปิดแอร์ ':
+                #     print('turning on AC')
+                # elif transcript == u'ออโต้ ไฟใหม้ ' or transcript == u'เอาโต ไฟไหม้ ' or transcript == u'oppo ไฟไหม้' \
+                #         or transcript == u'auto ไฟไหม้ ' or transcript == u' auto ไฟไหม้ ' or transcript == u'รถตู้ไฟไหม้ '\
+                #         or transcript == u'oppo find ไม่ ' or transcript == u'เอาตู้ไฟไหม้ ':
+                #     print('ตำรวจดับเพลิงกำลังมาครับ')
+                # elif transcript == u'ออโต้ เปิดทีวี ' or transcript == u'เอาโต เปิดทีวี ' or transcript == u'oppo เปิดทีวี ' \
+                #         or transcript == u'auto เปิดทีวี ' or transcript == u' auto เปิดทีวี ':
+                #     print('turning on TV')
 
-        else:
-            print(transcript + overwrite_chars)
-
-            # Exit recognition if any of the transcribed phrases could be
-            # one of our keywords.
-            if re.search(r'\b(exit|quit)\b', transcript, re.I):
-                print('Exiting..')
-                break
+                elif u'เปิดไฟ' in transcript:
+                    turn_on_light()
+                    print('turning on light')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการเปิดไฟให้แล้วค่ะ  ')
+                elif u'ปิดไฟ' in transcript:
+                    turn_off_light()
+                    print('turning off light')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการปิดไฟให้แล้วค่ะ  ')
+                elif u'ช่วยด้วย' in transcript:
+                    print(u'พร้อมมาช่วยแล้วครับ')
+                    text_to_speech(u'อัลโต้ได้ส่งข้อความและโทรเรียกคนในบ้านให้แล้วค่ะ ')
+                elif u'เรียกตำรวจ' in transcript or u'ตำรวจ' in transcript:
+                    print(u'ตำรวจอยู่ระหว่างทางกำลังมา')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้เรียกตำรวจให้แล้วนะค่ะ อยู่ระหว่างทางค่ะ ')
+                elif u'โรงพยาบาล' in transcript:
+                    print(u'โรงพยาบาลกำลังมาช่วยเหลือครับ')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้เรียกรถพยาบาลให้แล้วนะค่ะ อยู่ระหว่างทางค่ะ ')
+                elif u'เปิดแอร์' in transcript:
+                    turn_on_ac()
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการเปิดแอร์ให้แล้วค่ะ รอสักพักนะค่ะ ')
+                    print('turning on AC')
+                elif u'ปิดแอร์' in transcript:
+                    turn_off_ac()
+                    print('turning off AC')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการปิดแอร์ให้แล้วค่ะ สบายใจได้หายห่วง ')
+                elif u'ไฟไหม้' in transcript:
+                    print('ตำรวจดับเพลิงกำลังมาครับ')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้เรียกรถดับเพลิงให้อย่างเร่งด่วนแล้วค่ะ รอสักแป๊ปนะค่ะ ')
+                elif u'เปิดทีวี' in transcript:
+                    turn_on_tv()
+                    print('turning on TV')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการเปิดทีวีให้แล้วค่ะ คอยติดตามชมนะค่ะ ')
+                elif u'ปิดทีวี' in transcript:
+                    turn_off_tv()
+                    print('turning off TV')
+                    time.sleep(2)
+                    text_to_speech(u'อัลโต้ได้ทำการปิดทีวีให้แล้วค่ะ คอยติดตามชมนะค่ะ ')
+                elif u'ออก' in transcript:
+                    print('Exiting..')
+                    break
+                else:
+                    print("text not matched transcript")
+                    print(transcript)
 
             num_chars_printed = 0
+    except:
+        print("error in listen_print_loop")
 
+def turn_on_ac():
+    # My API
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/9b86fd56-4de8-4b1d-b2de-98c3f5243e27
+    print("sending turning on AC command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/9b86fd56-4de8-4b1d-b2de-98c3f5243e27",
+            headers={
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "on"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def turn_off_ac():
+    # My API
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/9b86fd56-4de8-4b1d-b2de-98c3f5243e27
+    print("sending turning off AC command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/9b86fd56-4de8-4b1d-b2de-98c3f5243e27",
+            headers={
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "off"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def turn_on_light():
+    # front lifx
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/08e75403-af24-4dcf-b1d6-ce253008858a
+    print("sending turning on Light command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/08e75403-af24-4dcf-b1d6-ce253008858a",
+            headers={
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "on"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def turn_off_light():
+    # front lifx
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/08e75403-af24-4dcf-b1d6-ce253008858a
+    print("sending turning off Light command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/08e75403-af24-4dcf-b1d6-ce253008858a",
+            headers={
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "off"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def turn_on_tv():
+    # TV
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/b64f5e3a-d447-48f8-8d86-050de41cec7a
+    print("sending turning on TV command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/b64f5e3a-d447-48f8-8d86-050de41cec7a",
+            headers={
+                "Cookie": "JSESSIONID=FCCFD41E2393191D2AA158F251B09CDF-n2",
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "on"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def turn_off_tv():
+    # TV
+    # PUT https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/b64f5e3a-d447-48f8-8d86-050de41cec7a
+    print("sending turning off TV command")
+    try:
+        response = requests.put(
+            url="https://graph.api.smartthings.com/api/smartapps/installations/a0304624-dc42-4d93-b84f-421ff52167ca/switches/b64f5e3a-d447-48f8-8d86-050de41cec7a",
+            headers={
+                "Cookie": "JSESSIONID=FCCFD41E2393191D2AA158F251B09CDF-n2",
+                "Authorization": "Bearer 9e450b2e-3acf-4494-8183-c01806684bd2",
+                "Content-Type": "application/json; charset=utf-8",
+            },
+            data=json.dumps({
+                "command": "off"
+            })
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
+
+def text_to_speech(msg):
+    # Request (4)
+    # POST http://localhost:8888/test
+
+    try:
+        response = requests.post(
+            url="http://localhost:8888/test",
+            headers={
+                "Cookie": "_xsrf=2|944ae2e2|73e716843e1dd25abd7365e04aec06e7|1490541278",
+                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            },
+            data={
+                "message": msg,
+            },
+        )
+        print('Response HTTP Status Code: {status_code}'.format(
+            status_code=response.status_code))
+        print('Response HTTP Response Body: {content}'.format(
+            content=response.content))
+    except requests.exceptions.RequestException:
+        print('HTTP Request failed')
 
 def main():
     service = cloud_speech_pb2.SpeechStub(
@@ -224,7 +538,6 @@ def main():
         # Now, put the transcription responses to use.
         try:
             listen_print_loop(recognize_stream)
-
             recognize_stream.cancel()
         except grpc.RpcError as e:
             code = e.code()
@@ -232,6 +545,10 @@ def main():
             if code is not code.CANCELLED:
                 raise
 
+    # tornado.options.parse_command_line()
+    # app = Application()
+    # app.listen(options.port)
+    # tornado.ioloop.IOLoop.current().start()
 
 if __name__ == '__main__':
     main()
