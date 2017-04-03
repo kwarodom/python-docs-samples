@@ -50,7 +50,9 @@ var updater = {
     socket: null,
 
     start: function() {
-        var url = "ws://192.168.85.196/chatsocket";
+        // var url = "ws://" + location.host + "/chatsocket";
+        var url = "ws://192.168.85.196:8080/chatsocket";
+        // var url = "ws://localhost/chatsocket";
         console.log("received message");
         updater.socket = new WebSocket(url);
         updater.socket.onmessage = function(event) {

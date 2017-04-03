@@ -502,15 +502,15 @@ def text_to_speech(msg):
     # POST http://localhost:8888/test
 
     try:
-        response = requests.post(
-            url="http://localhost:8888/test",
-            headers={
-                "Cookie": "_xsrf=2|944ae2e2|73e716843e1dd25abd7365e04aec06e7|1490541278",
-                "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-            },
-            data={
-                "message": msg,
-            },
+        response = requests.get(
+            url="http://localhost:8080/websocket",
+            # headers={
+            #     "Cookie": "_xsrf=2|944ae2e2|73e716843e1dd25abd7365e04aec06e7|1490541278",
+            #     "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            # },
+            # data={
+            #     "message": msg,
+            # },
         )
         print('Response HTTP Status Code: {status_code}'.format(
             status_code=response.status_code))
